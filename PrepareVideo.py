@@ -2,15 +2,27 @@ import DeintelaceVideo
 from os import path
 import os
 import cv2
+from PIL import Image
 import pickle
 import insightface
 import numpy as np
 import face_alignment
 import Scene_segmentation
 import matplotlib.pyplot as plt
-import time
 from sklearn.cluster import KMeans
-from collections import Counter
+
+# gaze
+import torch
+import torchvision.transforms as transforms
+from gaze360.code.model import GazeLSTM
+image_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+model = GazeLSTM()
+model = torch.nn.DataParallel(model)
+model.cpu()
+checkpoint = torch.load(r'C:\Users\azmihaid\PycharmProjects\LieDet\gaze360\gaze360_model.pth.tar', map_location=torch.device('cpu'))
+model.load_state_dict(checkpoint['state_dict'])
+model.eval()
+
 
 # configurations
 show = False
@@ -26,6 +38,34 @@ recognition_similarity_thresh = 0.3
 recognition_model = insightface.model_zoo.get_model('arcface_r100_v1')
 recognition_model.prepare(ctx_id=ctx)
 
+
+def spherical2cartesial(x):
+    output = torch.zeros(x.size(0),3)
+    output[:,2] = -torch.cos(x[:,1])*torch.cos(x[:,0])
+    output[:,0] = torch.cos(x[:,1])*torch.sin(x[:,0])
+    output[:,1] = torch.sin(x[:,1])
+    return output
+
+
+def gaze_detection(frames, face_boxes, scenes):
+    for person, indexes in scenes.values():
+        if person == -1:
+            continue
+        if indexes[1] - indexes[0] < 7:
+            continue
+
+        gaze_vectors = []
+        for idx in range(indexes[0],indexes[1]-7):
+            input_image = torch.zeros(7, 3, 224, 224)
+            for j in range(7):
+                frame = frames[idx+j]
+                box = face_boxes[idx+j][0]
+                face_cut = frame[box[1]: box[3], box[0]: box[2],:]
+                face_im = Image.fromarray(face_cut, 'RGB')
+                input_image[j, :, :, :] = image_normalize(transforms.ToTensor()(transforms.Resize((224, 224))(face_im)))
+            output_gaze, _ = model(input_image.view(1, 7, 3, 224, 224).cpu())
+            gaze = spherical2cartesial(output_gaze).detach().numpy()
+            gaze_vectors.append(gaze)
 
 def face_change(last_person, current_person):
     emb1 = last_person.flatten()
@@ -177,9 +217,7 @@ def save_scenes(folder,frames,scene_cuts):
     return num_written_frames
 
 
-if __name__ == '__main__':
-
-    file_path = r"C:\Users\azmihaid\OneDrive - Intel Corporation\Desktop\New folder\1.02\VTS_01_4.VOB"
+def process_video(file_path):
     head_tail = path.split(file_path)
     analysis_folder = path.join(head_tail[0], head_tail[1][:-4] + '_analysis')
     if not path.isdir(analysis_folder):
@@ -222,119 +260,20 @@ if __name__ == '__main__':
     # final scene cuts -----------------------------------------------------------------------------------
     scenes_directory = path.join(analysis_folder, 'cut_scenes')
     if not path.exists(scenes_directory):
-        scenes_starts_based_on_tracking = track_persons(face_encodings)
-        scenes_starts = np.logical_or(scenes_starts_based_on_structure, scenes_starts_based_on_tracking)
-        scene_info = cluster_persons_scenes(face_encodings, scenes_starts)
         os.mkdir(scenes_directory)
-        frs = save_scenes(scenes_directory,frames,scene_info)
-        print('Number of frames saved = ' + str(frs) + ' from ' + str(len(frames)))
+    scenes_starts_based_on_tracking = track_persons(face_encodings)
+    scenes_starts = np.logical_or(scenes_starts_based_on_structure, scenes_starts_based_on_tracking)
+    scene_info = cluster_persons_scenes(face_encodings, scenes_starts)
 
+    #frs = save_scenes(scenes_directory,frames,scene_info)
+    #print('Number of frames saved = ' + str(frs) + ' from ' + str(len(frames)))
 
     # Gaze detection -------------------------------------------------------------------------------------
+    gaze_detection(frames,bounding_boxes,scene_info)
 
 
 
 
-    '''
-
-    # save scenes
-    out = cv2.VideoWriter(file_path[:-4]+'_scenes.mp4', cv2.VideoWriter_fourcc(*'DIVX'), 20, (360, 288))
-    for f in range(len(frames)):
-        if scenes_starts[f]:
-            for i in range(60):
-                out.write(frames[f])
-        out.write(frames[f])
-    out.release()
-    # fineto
-
-
-# visualization
-if faces is not None:
-    print('find', faces.shape[0], 'faces')
-    for i in range(faces.shape[0]):
-        # print('score', faces[i][4])
-        box = faces[i].astype(np.int)
-        color = (0, 0, 255)
-        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-        if landmarks is not None:
-            landmark5 = landmarks[i].astype(np.int)
-            for l in range(landmark5.shape[0]):
-                color = (0, 0, 255)
-                if l == 0 or l == 3:
-                    color = (0, 255, 0)
-                cv2.circle(frame, (landmark5[l][0], landmark5[l][1]), 1, color,2)
-cv2.imshow('Figure',frame)
-cv2.waitKey(1)
- '''
-'''
-
-def get_box(rect):
-    return rect[1], rect[0], rect[3] - rect[1], rect[2] - rect[0]
-
-def get_side_box(rect):
-    return rect[1], rect[0] + rect[2], rect[1] + rect[3], rect[0]
-
-
-def overlap(rect1, rect2):
-    # bottom, right, top, left
-    # 'low y, high x, high y, low x'
-    if rect1[3] >= rect2[1] or rect2[3] >= rect1[1]:
-        return False
-    if rect1[2] <= rect2[0] or rect2[2] <= rect1[0]:
-        return False
-    return True
-
-def get_detectors():
-    detector = partial(face_recognition.face_locations, model='cnn')
-    caspath = path.join(r'C:\Python\Lib\site-packages\cv2\data', r'haarcascade_profileface.xml')
-    side = cv2.CascadeClassifier(caspath)
-
-    def side_detector(image):
-        return side.detectMultiScale(
-            image, scaleFactor=1.1, minNeighbors=8, flags=cv2.CASCADE_SCALE_IMAGE)
-
-    return detector, side_detector, face_recognition  # , predictor
-
-
-def detect_faces(image):
-    # Detect faces in the image
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    detector, side_face_detector, face_recognition = get_detectors()
-    face_rects = detector(gray)
-
-    box = face_rects
-    for item in map(get_side_box, side_face_detector(image)):
-        if len(item):
-            box.append(item)
-    if len(box) > 1:
-        fset = set()
-        skip = None
-        for a, b in combinations(box, 2):
-            a = tuple(a)
-            b = tuple(b)
-            if skip is a:
-                continue
-            fset.add(b)
-            if overlap(a, b):
-                if a in fset:
-                    fset.remove(a)
-                skip = a
-            else:
-                fset.add(a)
-        box = list(fset)
-
-    # Draw a rectangle around the faces
-    if len(box)>0:
-        for (x, y, w, h) in face_rects:
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-    cv2.imshow("Faces found", image)
-    cv2.waitKey(1)
-
-
-'''
-
-
-
-
-
+if __name__ == '__main__':
+    single_video_to_process = r"C:\Users\azmihaid\OneDrive - Intel Corporation\Desktop\New folder\1.02\VTS_01_4.VOB"
+    process_video(single_video_to_process)
